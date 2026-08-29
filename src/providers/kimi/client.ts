@@ -12,18 +12,18 @@ export class KimiWebClient extends BaseApiClient<KimiWebAuth> {
 	readonly providerId = "kimi-web";
 
 	protected readonly config: ApiClientConfig = {
-		hostKey: "kimi.com",
-		startUrl: "https://www.kimi.com/",
-		cookieDomain: ".kimi.com",
-		defaultModel: "moonshot-v1-32k",
+		hostKey: "www.kimi.ai",
+		startUrl: "https://www.kimi.ai/",
+		cookieDomain: ".kimi.ai",
+		defaultModel: "k3",
 		models: [
-			{ id: "moonshot-v1-8k", name: "Moonshot v1 8K" },
-			{ id: "moonshot-v1-32k", name: "Moonshot v1 32K" },
-			{ id: "moonshot-v1-128k", name: "Moonshot v1 128K" },
+			{ id: "k3-instant", name: "Kimi Instant" },
+			{ id: "k3", name: "Kimi K3" },
+			{ id: "k3-stream", name: "Kimi K3 Stream" },
 		],
 	};
 
-	private readonly baseUrl = "https://www.kimi.com";
+	private readonly baseUrl = "https://www.kimi.ai";
 
 	protected getCookies(): BrowserCookie[] {
 		return [];
@@ -44,7 +44,7 @@ export class KimiWebClient extends BaseApiClient<KimiWebAuth> {
 		const cookie = this.auth.cookie || "";
 		if (cookie.trim()) {
 			const pageUrl = this.page.url() ?? this.baseUrl;
-			const domain = pageUrl.includes("moonshot.cn") ? ".moonshot.cn" : ".kimi.com";
+			const domain = pageUrl.includes("moonshot.cn") ? ".moonshot.cn" : ".kimi.ai";
 			const cookies = parseCookieHeader(cookie, domain).map((c) => ({
 				...c,
 				...(c.name.startsWith("__Secure-") || c.name.startsWith("__Host-") ? { secure: true } : {}),
@@ -59,7 +59,20 @@ export class KimiWebClient extends BaseApiClient<KimiWebAuth> {
 		const ctx = await bm.getContext();
 		const cookies = await ctx.cookies([this.baseUrl]);
 		const kimiAuthCookie = cookies.find((c) => c.name === "kimi-auth")?.value;
-		const authToken = this.auth.accessToken || kimiAuthCookie;
+		// Prefer live token from page localStorage (auto-refreshed by Kimi web app) over stale stored token.
+		let liveToken: string | null = null;
+		try {
+			liveToken = await page.evaluate(() => {
+				try {
+					return localStorage.getItem("access_token");
+				} catch {
+					return null;
+				}
+			});
+		} catch {
+			// page may not be ready; fallback to stored credentials
+		}
+		const authToken = liveToken || this.auth.accessToken || kimiAuthCookie;
 		if (!authToken) {
 			return {
 				ok: false,
@@ -70,99 +83,130 @@ export class KimiWebClient extends BaseApiClient<KimiWebAuth> {
 		}
 
 		const model = params.model;
-		const result = await page.evaluate(
-			async ({
-				baseUrl,
-				message,
-				kimiAuthToken,
-				scenario,
-			}: {
-				baseUrl: string;
-				message: string;
-				kimiAuthToken: string;
-				scenario: string;
-			}) => {
-				const req = {
-					scenario,
-					message: {
-						role: "user" as const,
-						blocks: [{ message_id: "", text: { content: message } }],
-						scenario,
-					},
-					options: { thinking: false },
-				};
-				const enc = new TextEncoder().encode(JSON.stringify(req));
-				const buf = new ArrayBuffer(5 + enc.byteLength);
-				const dv = new DataView(buf);
-				dv.setUint8(0, 0x00);
-				dv.setUint32(1, enc.byteLength, false);
-				new Uint8Array(buf, 5).set(enc);
+		const scenario = model.includes("search")
+			? "SCENARIO_SEARCH"
+			: model.includes("research")
+				? "SCENARIO_RESEARCH"
+				: model.includes("k1")
+					? "SCENARIO_K1"
+					: "SCENARIO_K2";
 
-				const res = await fetch(`${baseUrl}/apiv2/kimi.gateway.chat.v1.ChatService/Chat`, {
-					method: "POST",
-					headers: {
-						"Content-Type": "application/connect+json",
-						"Connect-Protocol-Version": "1",
-						Accept: "*/*",
-						Origin: baseUrl,
-						Referer: `${baseUrl}/`,
-						"X-Language": "zh-CN",
-						"X-Msh-Platform": "web",
-						Authorization: `Bearer ${kimiAuthToken}`,
-					},
-					body: buf,
-				});
-				if (!res.ok) {
-					const text = await res.text();
-					return { ok: false as const, status: res.status, error: text.slice(0, 400) };
-				}
-				const arr = await res.arrayBuffer();
-				const u8 = new Uint8Array(arr);
-				const texts: string[] = [];
-				let o = 0;
-				while (o + 5 <= u8.length) {
-					const len = new DataView(u8.buffer, u8.byteOffset + o + 1, 4).getUint32(0, false);
-					if (o + 5 + len > u8.length) break;
-					const chunk = u8.slice(o + 5, o + 5 + len);
-					try {
-						const obj = JSON.parse(new TextDecoder().decode(chunk));
-						if (obj.error)
-							return {
-								ok: false as const,
-								error:
-									obj.error.message || obj.error.code || JSON.stringify(obj.error).slice(0, 200),
-							};
-						const op = obj.op || "";
-						if (obj.block?.text?.content && (op === "append" || op === "set"))
-							texts.push(obj.block.text.content);
-						else if (obj.text?.content && (op === "append" || op === "set"))
-							texts.push(obj.text.content);
-						if (!op && obj.message?.role === "assistant" && obj.message?.blocks) {
-							for (const blk of obj.message.blocks) {
-								if (blk.text?.content) texts.push(blk.text.content);
-							}
-						}
-						if (obj.done) break;
-					} catch {
-						/* ignore */
+		const doChat = async (token: string) =>
+			page.evaluate(
+				async ({
+					baseUrl,
+					message,
+					kimiAuthToken,
+					scenario,
+				}: {
+					baseUrl: string;
+					message: string;
+					kimiAuthToken: string;
+					scenario: string;
+				}) => {
+					const req = {
+						scenario,
+						message: {
+							role: "user" as const,
+							blocks: [{ message_id: "", text: { content: message } }],
+							scenario,
+						},
+						options: { thinking: false },
+					};
+					const enc = new TextEncoder().encode(JSON.stringify(req));
+					const buf = new ArrayBuffer(5 + enc.byteLength);
+					const dv = new DataView(buf);
+					dv.setUint8(0, 0x00);
+					dv.setUint32(1, enc.byteLength, false);
+					new Uint8Array(buf, 5).set(enc);
+
+					const res = await fetch(`${baseUrl}/apiv2/kimi.gateway.chat.v1.ChatService/Chat`, {
+						method: "POST",
+						headers: {
+							"Content-Type": "application/connect+json",
+							"Connect-Protocol-Version": "1",
+							Accept: "*/*",
+							Origin: baseUrl,
+							Referer: `${baseUrl}/`,
+							"X-Language": "zh-CN",
+							"X-Msh-Platform": "web",
+							Authorization: `Bearer ${kimiAuthToken}`,
+						},
+						body: buf,
+					});
+					if (!res.ok) {
+						const text = await res.text();
+						return { ok: false as const, status: res.status, error: text.slice(0, 400) };
 					}
-					o += 5 + len;
+					const arr = await res.arrayBuffer();
+					const u8 = new Uint8Array(arr);
+					const texts: string[] = [];
+					let o = 0;
+					while (o + 5 <= u8.length) {
+						const len = new DataView(u8.buffer, u8.byteOffset + o + 1, 4).getUint32(0, false);
+						if (o + 5 + len > u8.length) break;
+						const chunk = u8.slice(o + 5, o + 5 + len);
+						try {
+							const obj = JSON.parse(new TextDecoder().decode(chunk));
+							if (obj.error)
+								return {
+									ok: false as const,
+									error:
+										obj.error.message || obj.error.code || JSON.stringify(obj.error).slice(0, 200),
+								};
+							const op = obj.op || "";
+							if (obj.block?.text?.content && (op === "append" || op === "set"))
+								texts.push(obj.block.text.content);
+							else if (obj.text?.content && (op === "append" || op === "set"))
+								texts.push(obj.text.content);
+							if (!op && obj.message?.role === "assistant" && obj.message?.blocks) {
+								for (const blk of obj.message.blocks) {
+									if (blk.text?.content) texts.push(blk.text.content);
+								}
+							}
+							if (obj.done) break;
+						} catch {
+							/* ignore */
+						}
+						o += 5 + len;
+					}
+					return { ok: true as const, text: texts.join("") };
+				},
+				{
+					baseUrl: this.baseUrl,
+					message: params.message,
+					kimiAuthToken: token,
+					scenario,
+				},
+			);
+
+		let result = await doChat(authToken);
+
+		// If token expired (401), try to reload page to refresh localStorage token and retry once.
+		if (!result.ok && (result as { status?: number }).status === 401) {
+			try {
+				await page.reload({ waitUntil: "domcontentloaded" });
+				await page.waitForTimeout(1500);
+				let refreshedToken: string | null = null;
+				try {
+					refreshedToken = await page.evaluate(() => {
+						try {
+							return localStorage.getItem("access_token");
+						} catch {
+							return null;
+						}
+					});
+				} catch {
+					// ignore
 				}
-				return { ok: true as const, text: texts.join("") };
-			},
-			{
-				baseUrl: this.baseUrl,
-				message: params.message,
-				kimiAuthToken: authToken,
-				scenario: model.includes("search")
-					? "SCENARIO_SEARCH"
-					: model.includes("research")
-						? "SCENARIO_RESEARCH"
-						: model.includes("k1")
-							? "SCENARIO_K1"
-							: "SCENARIO_K2",
-			},
-		);
+				const retryToken = refreshedToken || this.auth.accessToken;
+				if (retryToken && retryToken !== authToken) {
+					result = await doChat(retryToken);
+				}
+			} catch {
+				// keep original 401 result
+			}
+		}
 
 		if (!result.ok) {
 			return {
