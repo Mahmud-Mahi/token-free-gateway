@@ -24,14 +24,11 @@ export class ClaudeWebClient extends BaseApiClient<ClaudeWebAuth> {
 		hostKey: "claude.ai",
 		startUrl: "https://claude.ai/",
 		cookieDomain: ".claude.ai",
-		defaultModel: "claude-sonnet-4-20250514",
+		defaultModel: "claude-sonnet-4-6",
 		models: [
-			{ id: "claude-sonnet-4-20250514", name: "Claude Sonnet 4" },
+			{ id: "claude-sonnet-5", name: "Claude Sonnet 5" },
 			{ id: "claude-sonnet-4-6", name: "Claude Sonnet 4.6" },
-			{ id: "claude-opus-4-20250514", name: "Claude Opus 4" },
-			{ id: "claude-opus-4-6", name: "Claude Opus 4.6" },
-			{ id: "claude-haiku-4-20250514", name: "Claude Haiku 4" },
-			{ id: "claude-haiku-4-6", name: "Claude Haiku 4.6" },
+			{ id: "claude-haiku-4-5", name: "Claude Haiku 4.5" },
 		],
 	};
 
@@ -65,6 +62,35 @@ export class ClaudeWebClient extends BaseApiClient<ClaudeWebAuth> {
 			}
 		} catch {
 			/* ignore */
+		}
+	}
+
+	/**
+	 * Discover available models from the user's Claude account.
+	 * This queries the Claude web API to find what models the user actually has access to.
+	 */
+	async discoverAvailableModels(): Promise<string[]> {
+		try {
+			const page = await this.getPage();
+			const models = await page.evaluate(async (baseUrl: string) => {
+				// Try to get model list from available endpoints
+				const endpoints = [`${baseUrl}/models`, `${baseUrl}/available_models`];
+				for (const url of endpoints) {
+					try {
+						const res = await fetch(url, { credentials: "include" });
+						if (res.ok) {
+							const data = await res.json();
+							if (Array.isArray(data)) return data.map((m: any) => m.id || m.name);
+							if (data.models && Array.isArray(data.models))
+								return data.models.map((m: any) => m.id || m.name);
+						}
+					} catch {}
+				}
+				return [];
+			}, this.baseUrl);
+			return models;
+		} catch {
+			return [];
 		}
 	}
 
