@@ -22,10 +22,12 @@ export class QwenCNWebClient extends BaseApiClient<QwenCNWebAuth> {
 		hostKey: "qianwen.com",
 		startUrl: "https://www.qianwen.com/",
 		cookieDomain: ".qianwen.com",
-		defaultModel: "Qwen3.5-Plus",
+		defaultModel: "qwen3.7-cn",
 		models: [
-			{ id: "Qwen3.5-Plus", name: "Qwen 3.5 Plus (CN)" },
-			{ id: "Qwen3.5-Turbo", name: "Qwen 3.5 Turbo (CN)" },
+			{ id: "qwen3.7-cn", name: "Qwen 3.7 (CN)" },
+			{ id: "qwen3.8-max-cn", name: "Qwen 3.8 Max (CN)" },
+			{ id: "qwen3.7-max-cn", name: "Qwen 3.7 Max (CN)" },
+			{ id: "qwen3.6-flash-cn", name: "Qwen 3.6 Flash (CN)" },
 		],
 	};
 
@@ -79,6 +81,17 @@ export class QwenCNWebClient extends BaseApiClient<QwenCNWebAuth> {
 		const sessionId = randomSessionId();
 		const timestamp = Date.now();
 		const nonce = Math.random().toString(36).slice(2);
+		// Normalize model: case-insensitive, strip "-CN" suffix, map to upstream correct case (Qwen3.7 etc.)
+		const stripCN = (m: string) => (m.toLowerCase().endsWith("-cn") ? m.slice(0, -3) : m);
+		const raw = stripCN(params.model);
+		const lower = raw.toLowerCase();
+		const upstreamMap: Record<string, string> = {
+			"qwen3.7": "Qwen3.7",
+			"qwen3.8-max": "Qwen3.8-Max",
+			"qwen3.7-max": "Qwen3.7-Max",
+			"qwen3.6-flash": "Qwen3.6-Flash",
+		};
+		const upstreamModel = upstreamMap[lower] ?? raw;
 		return (await page.evaluate(
 			async ({ baseUrl, sessionId, model, message, ut, xsrfToken, deviceId, nonce, timestamp }) => {
 				try {
@@ -138,7 +151,7 @@ export class QwenCNWebClient extends BaseApiClient<QwenCNWebAuth> {
 			{
 				baseUrl: this.baseUrl,
 				sessionId,
-				model: params.model,
+				model: upstreamModel,
 				message: params.message,
 				ut: this.ut,
 				xsrfToken: this.xsrfToken,
