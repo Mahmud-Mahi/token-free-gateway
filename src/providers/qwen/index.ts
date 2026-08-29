@@ -5,10 +5,10 @@ import { QwenWebClient } from "./client.ts";
 
 export const definition: ProviderDefinition = {
 	id: "qwen-web",
-	name: "Qwen Web",
+	name: "Qwen Intl Web",
 	models: [
-		{ id: "qwen3.5-plus", name: "Qwen 3.5 Plus" },
-		{ id: "qwen3.5-turbo", name: "Qwen 3.5 Turbo" },
+		{ id: "qwen3.7-plus-intl", name: "Qwen 3.7 Plus (Intl)" },
+		{ id: "qwen3.8-max-intl", name: "Qwen 3.8 Max (Intl)" },
 	],
 	factory: (credentials) => new QwenWebClient(credentials as QwenWebAuth),
 	loginFn: loginQwenWeb,
