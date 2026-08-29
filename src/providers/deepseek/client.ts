@@ -312,7 +312,7 @@ export class DeepSeekWebClient extends BaseApiClient<DeepSeekWebCredentials> {
 			parent_message_id: params.parentMessageId ?? null,
 			prompt: params.message,
 			ref_file_ids: params.fileIds || [],
-			thinking_enabled: !(params.model === "deepseek-chat" && !params.model?.includes("reasoning")),
+			thinking_enabled: true,
 			search_enabled: params.searchEnabled ?? true,
 			preempt: params.preempt ?? false,
 		};
