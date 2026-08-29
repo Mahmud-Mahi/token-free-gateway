@@ -26,66 +26,71 @@ export class XiaomiMimoWebClient extends BaseApiClient<XiaomiMimoWebAuth> {
 		models: [{ id: "xiaomimo-chat", name: "MiMo Chat" }],
 	};
 
-	private serviceToken: string;
-	private botPh: string;
-
-	constructor(auth: XiaomiMimoWebAuth) {
-		super(auth);
-		const serviceTokenMatch = auth.cookie.match(/serviceToken="?([^;"\s]+)/);
-		this.serviceToken = serviceTokenMatch?.[1] || "";
-		const botPhMatch = auth.cookie.match(/xiaomichatbot_ph="?([^;"\s]+)/);
-		this.botPh = botPhMatch?.[1] || "";
-	}
-
 	protected getCookies() {
 		return parseCookieHeader(this.auth.cookie, this.config.cookieDomain);
 	}
 
 	protected async callApi(page: Page, params: NormalizedSendParams): Promise<EvalResult> {
-		let url = `${XIAOMIMO_BASE_URL}/open-apis/bot/chat`;
-		if (this.botPh) {
-			url += `?xiaomichatbot_ph=${encodeURIComponent(this.botPh)}`;
-		}
-
+		const conversationId = randomHex32();
+		const msgId = randomHex32();
 		const requestBody = {
-			msgId: randomHex32(),
-			conversationId: randomHex32(),
+			msgId,
+			conversationId,
 			query: params.message,
+			isEditedQuery: false,
 			modelConfig: {
 				enableThinking: false,
-				temperature: 0.8,
-				topP: 0.95,
 				webSearchStatus: "disabled",
-				model: "mimo-v2-flash-studio",
+				model: "mimo-v2.5",
 			},
 			multiMedias: [],
 		};
 
 		return (await page.evaluate(
 			async (args: {
-				requestUrl: string;
-				cookie: string;
-				userAgent: string;
-				serviceToken: string;
-				botPh: string;
 				baseUrl: string;
 				bodyJson: string;
+				conversationId: string;
 			}) => {
-				const { requestUrl, cookie, userAgent, serviceToken, botPh, baseUrl, bodyJson } = args;
-				const headers: Record<string, string> = {
-					Cookie: cookie,
-					"User-Agent": userAgent,
+				const { baseUrl, bodyJson, conversationId } = args;
+				const cookie = document.cookie;
+				const phMatch = cookie.match(/xiaomichatbot_ph="?([^;"\s]+)/);
+				const botPh = phMatch?.[1] || "";
+				const tz = Intl.DateTimeFormat().resolvedOptions().timeZone || "Asia/Shanghai";
+				const baseHeaders: Record<string, string> = {
 					"Content-Type": "application/json",
-					Accept: "*/*",
-					...(serviceToken ? { Authorization: `Bearer ${serviceToken}` } : {}),
 					Referer: `${baseUrl}/`,
-					Origin: baseUrl,
-					"x-timezone": "Asia/Shanghai",
-					bot_ph: botPh,
+					"x-timeZone": tz,
 				};
+				// The frontend creates the conversation first via /open-apis/chat/conversation/save
+				// then calls /open-apis/bot/chat with the same conversationId.
+				// Without the save, the server may return 401/busy or empty stream.
+				const saveUrl = botPh
+					? `${baseUrl}/open-apis/chat/conversation/save?xiaomichatbot_ph=${encodeURIComponent(botPh)}`
+					: `${baseUrl}/open-apis/chat/conversation/save`;
+				const saveBody = JSON.stringify({
+					conversationId,
+					title: "New conversation",
+					type: "chat",
+				});
+				try {
+					await fetch(saveUrl, {
+						method: "POST",
+						headers: baseHeaders,
+						body: saveBody,
+						credentials: "include",
+					});
+				} catch {
+					// non-fatal: proceed to chat even if save fails (e.g. already exists)
+				}
+
+				let requestUrl = `${baseUrl}/open-apis/bot/chat`;
+				if (botPh) {
+					requestUrl += `?xiaomichatbot_ph=${encodeURIComponent(botPh)}`;
+				}
 				const res = await fetch(requestUrl, {
 					method: "POST",
-					headers,
+					headers: baseHeaders,
 					body: bodyJson,
 					credentials: "include",
 				});
@@ -100,13 +105,9 @@ export class XiaomiMimoWebClient extends BaseApiClient<XiaomiMimoWebAuth> {
 				return { ok: true as const, data: text };
 			},
 			{
-				requestUrl: url,
-				cookie: this.auth.cookie,
-				userAgent: this.auth.userAgent || "Mozilla/5.0",
-				serviceToken: this.serviceToken,
-				botPh: this.botPh,
 				baseUrl: XIAOMIMO_BASE_URL,
 				bodyJson: JSON.stringify(requestBody),
+				conversationId,
 			},
 		)) as EvalResult;
 	}
