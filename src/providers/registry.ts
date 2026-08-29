@@ -16,11 +16,11 @@ async function loadDefinitions(): Promise<ProviderDefinition[]> {
 		claude,
 		chatgpt,
 		deepseek,
-		doubao,
+		dola,
 		gemini,
 		glm,
 		glmIntl,
-		grok,
+		copilot,
 		kimi,
 		perplexity,
 		qwen,
@@ -30,11 +30,11 @@ async function loadDefinitions(): Promise<ProviderDefinition[]> {
 		import("./claude/index.ts"),
 		import("./chatgpt/index.ts"),
 		import("./deepseek/index.ts"),
-		import("./doubao/index.ts"),
+		import("./dola/index.ts"),
 		import("./gemini/index.ts"),
 		import("./glm/index.ts"),
 		import("./glm-intl/index.ts"),
-		import("./grok/index.ts"),
+		import("./copilot/index.ts"),
 		import("./kimi/index.ts"),
 		import("./perplexity/index.ts"),
 		import("./qwen/index.ts"),
@@ -46,11 +46,11 @@ async function loadDefinitions(): Promise<ProviderDefinition[]> {
 		claude.definition,
 		chatgpt.definition,
 		deepseek.definition,
-		doubao.definition,
+		dola.definition,
 		gemini.definition,
 		glm.definition,
 		glmIntl.definition,
-		grok.definition,
+		copilot.definition,
 		kimi.definition,
 		perplexity.definition,
 		qwen.definition,
@@ -110,9 +110,32 @@ export async function resolveModelToProvider(model: string): Promise<string | nu
 		if (defs.some((d) => d.id === providerId)) return providerId!;
 	}
 
-	// Search all providers for matching model ID
+	// Exact match (case-insensitive) for all providers - Qwen CN/Intl are distinct via "-cn"/"-intl" suffix
+	const lowModel = model.toLowerCase();
 	for (const def of defs) {
-		if (def.models.some((m) => m.id === model)) return def.id;
+		if (def.models.some((m) => m.id.toLowerCase() === lowModel)) return def.id;
+	}
+
+	// Backward compat: allow old IDs without suffix (e.g. "qwen3.7", "qwen3.8-max") to still resolve
+	// For ambiguous "qwen3.8-max" (exists in both CN and Intl), prefer Intl (qwen-web) for backward compat
+	const legacyMap: Record<string, string> = {
+		"qwen3.7": "qwen-cn-web",
+		"qwen3.7-plus": "qwen-web",
+		"qwen3.8-max": "qwen-web",
+		"qwen3.7-max": "qwen-cn-web",
+		"qwen3.6-flash": "qwen-cn-web",
+		"gpt-5.6-sol": "chatgpt-web",
+		"gpt-5.6-terra": "chatgpt-web",
+		"gpt-5.6-luna": "chatgpt-web",
+		"gpt-5": "chatgpt-web",
+		"gpt-4o": "chatgpt-web",
+	};
+	if (legacyMap[lowModel]) return legacyMap[lowModel]!;
+
+	// Flexible matching: if model starts with "claude-" and we have a claude-web provider,
+	// allow it (user may know the exact model ID their account supports)
+	if (model.startsWith("claude-") && defs.some((d) => d.id === "claude-web")) {
+		return "claude-web";
 	}
 
 	return null;
