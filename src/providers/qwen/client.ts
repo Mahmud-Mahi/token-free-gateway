@@ -15,10 +15,10 @@ export class QwenWebClient extends BaseApiClient<QwenWebAuth> {
 		hostKey: "qwen.ai",
 		startUrl: "https://chat.qwen.ai/",
 		cookieDomain: ".qwen.ai",
-		defaultModel: "qwen3.5-plus",
+		defaultModel: "qwen3.7-plus-intl",
 		models: [
-			{ id: "qwen3.5-plus", name: "Qwen 3.5 Plus" },
-			{ id: "qwen3.5-turbo", name: "Qwen 3.5 Turbo" },
+			{ id: "qwen3.7-plus-intl", name: "Qwen 3.7 Plus (Intl)" },
+			{ id: "qwen3.8-max-intl", name: "Qwen 3.8 Max (Intl)" },
 		],
 	};
 
@@ -32,9 +32,18 @@ export class QwenWebClient extends BaseApiClient<QwenWebAuth> {
 	}
 
 	protected async callApi(page: Page, params: NormalizedSendParams): Promise<EvalResult> {
+		const stripIntl = (m: string) => (m.toLowerCase().endsWith("-intl") ? m.slice(0, -5) : m);
+		const raw = stripIntl(params.model);
+		const lower = raw.toLowerCase();
+		const upstreamMap: Record<string, string> = {
+			"qwen3.7-plus": "qwen3.7-plus",
+			"qwen3.8-max": "qwen3.8-max",
+		};
+		const upstreamModel = upstreamMap[lower] ?? raw;
 		const createChatTimeoutMs = 30_000;
+		const authToken: string = this.auth.sessionToken;
 		const createChatResult = await page.evaluate(
-			async ({ baseUrl, timeoutMs }) => {
+			async ({ baseUrl, timeoutMs, authToken }) => {
 				let timer: ReturnType<typeof setTimeout> | undefined;
 				try {
 					const url = `${baseUrl}/api/v2/chats/new`;
@@ -42,7 +51,7 @@ export class QwenWebClient extends BaseApiClient<QwenWebAuth> {
 					timer = setTimeout(() => controller.abort(), timeoutMs);
 					const res = await fetch(url, {
 						method: "POST",
-						headers: { "Content-Type": "application/json" },
+						headers: { "Content-Type": "application/json", Authorization: `Bearer ${authToken}` },
 						body: JSON.stringify({}),
 						signal: controller.signal,
 					});
@@ -67,7 +76,7 @@ export class QwenWebClient extends BaseApiClient<QwenWebAuth> {
 					return { ok: false as const, status: 500, error: msg };
 				}
 			},
-			{ baseUrl: this.baseUrl, timeoutMs: createChatTimeoutMs },
+			{ baseUrl: this.baseUrl, timeoutMs: createChatTimeoutMs, authToken },
 		);
 
 		if (!createChatResult.ok || !createChatResult.chatId) {
@@ -82,7 +91,7 @@ export class QwenWebClient extends BaseApiClient<QwenWebAuth> {
 		const fetchTimeoutMs = 300_000;
 		const fid = crypto.randomUUID();
 		const responseData = await page.evaluate(
-			async ({ baseUrl, chatId, model, message, fid, timeoutMs }) => {
+			async ({ baseUrl, chatId, model, message, fid, timeoutMs, authToken }) => {
 				let timer: ReturnType<typeof setTimeout> | undefined;
 				try {
 					const url = `${baseUrl}/api/v2/chat/completions?chat_id=${chatId}`;
@@ -114,7 +123,11 @@ export class QwenWebClient extends BaseApiClient<QwenWebAuth> {
 					};
 					const res = await fetch(url, {
 						method: "POST",
-						headers: { "Content-Type": "application/json", Accept: "text/event-stream" },
+						headers: {
+							"Content-Type": "application/json",
+							Accept: "text/event-stream",
+							Authorization: `Bearer ${authToken}`,
+						},
 						body: JSON.stringify(requestBody),
 						signal: controller.signal,
 					});
@@ -149,10 +162,11 @@ export class QwenWebClient extends BaseApiClient<QwenWebAuth> {
 			{
 				baseUrl: this.baseUrl,
 				chatId,
-				model: params.model,
+				model: upstreamModel,
 				message: params.message,
 				fid,
 				timeoutMs: fetchTimeoutMs,
+				authToken,
 			},
 		);
 
