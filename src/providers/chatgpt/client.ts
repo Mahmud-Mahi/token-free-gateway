@@ -22,11 +22,10 @@ export class ChatGPTWebClient extends BaseApiClient<ChatGPTWebAuth> {
 		hostKey: "chatgpt.com",
 		startUrl: "https://chatgpt.com/",
 		cookieDomain: ".chatgpt.com",
-		defaultModel: "gpt-4",
+		defaultModel: "chatgpt-auto",
 		models: [
-			{ id: "gpt-4", name: "GPT-4" },
-			{ id: "gpt-4-turbo", name: "GPT-4 Turbo" },
-			{ id: "gpt-3.5-turbo", name: "GPT-3.5 Turbo" },
+			{ id: "chatgpt-auto", name: "ChatGPT Auto" },
+			{ id: "chatgpt-think", name: "ChatGPT Think" },
 		],
 	};
 
@@ -85,15 +84,34 @@ export class ChatGPTWebClient extends BaseApiClient<ChatGPTWebAuth> {
 		await new Promise((r) => setTimeout(r, 2000));
 	}
 
+	private resolveBackendModel(model: string): string {
+		const low = model.toLowerCase().trim();
+		// Normalize prefixed form "chatgpt-web/chatgpt-think" -> "chatgpt-think"
+		const base = low.includes("/") ? (low.split("/").pop() ?? low) : low;
+		// New canonical models
+		if (base === "chatgpt-auto") return "auto";
+		// "Think" requests a reasoning *experience* on the account's default model.
+		// Sending the literal model slug "o1" is rejected by the backend for many
+		// plans (free tier returns `usage_limit` → empty/null output). Keeping the
+		// backend model as "auto" (+ thinking_enabled/reasoning_effort below) is what
+		// the ChatGPT web UI does and returns real assistant content.
+		if (base === "chatgpt-think") return "auto";
+		// Legacy aliases (backward compat)
+		if (["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5", "gpt-4o", "gpt-4"].includes(base)) return "auto";
+		return model;
+	}
+
 	protected async callApi(page: Page, params: NormalizedSendParams): Promise<EvalResult> {
 		const convId = this.conversationId ?? "new";
 		const parentId = this.parentMessageId ?? randomUUID();
 		const messageId = randomUUID();
+		const isThinkModel = params.model.toLowerCase().includes("think");
+		const backendModel = this.resolveBackendModel(params.model);
 		console.log(
-			`[ChatGPT Web] Sending message, Conversation ID: ${convId}, Model: ${params.model}`,
+			`[ChatGPT Web] Sending message, Conversation ID: ${convId}, Model: ${params.model} -> backend: ${backendModel}${isThinkModel ? " (think)" : ""}`,
 		);
 
-		const body = {
+		const body: Record<string, unknown> = {
 			action: "next",
 			messages: [
 				{
@@ -103,7 +121,7 @@ export class ChatGPTWebClient extends BaseApiClient<ChatGPTWebAuth> {
 				},
 			],
 			parent_message_id: parentId,
-			model: params.model,
+			model: backendModel,
 			timezone_offset_min: new Date().getTimezoneOffset(),
 			conversation_id: convId === "new" ? undefined : convId,
 			history_and_training_disabled: false,
@@ -114,6 +132,15 @@ export class ChatGPTWebClient extends BaseApiClient<ChatGPTWebAuth> {
 			reset_rate_limits: false,
 			force_use_sse: true,
 		};
+
+		// Enable reasoning hints for chatgpt-think. The reasoning *experience* is
+		// requested via these flags (the backend model stays "auto" — see
+		// resolveBackendModel). Do NOT set force_paragen / force_paragen_model_slug:
+		// the backend rejects those fields with a 500 ("Something went wrong").
+		if (isThinkModel) {
+			(body as Record<string, unknown>).reasoning_effort = "medium";
+			(body as Record<string, unknown>).thinking_enabled = true;
+		}
 		const pageUrl = page.url();
 
 		return (await withTimeout(
