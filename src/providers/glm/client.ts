@@ -10,10 +10,8 @@ import type { GlmWebAuth } from "./auth.ts";
 import { parseGlmStream } from "./stream.ts";
 
 const ASSISTANT_ID_MAP: Record<string, string> = {
-	"glm-4-plus": "65940acff94777010aa6b796",
-	"glm-4": "65940acff94777010aa6b796",
-	"glm-4-think": "676411c38945bbc58a905d31",
-	"glm-4-zero": "676411c38945bbc58a905d31",
+	"glm-5.3-cn": "65940acff94777010aa6b796",
+	"glm-flash-cn": "65940acff94777010aa6b796",
 };
 const DEFAULT_ASSISTANT_ID = "65940acff94777010aa6b796";
 const SIGN_SECRET = "8a1317a7468aa3ad86e997d08f3f31cb";
@@ -52,8 +50,11 @@ export class GlmWebClient extends BaseApiClient<GlmWebAuth> {
 		hostKey: "chatglm.cn",
 		startUrl: "https://chatglm.cn",
 		cookieDomain: ".chatglm.cn",
-		defaultModel: "glm-4-plus",
-		models: [{ id: "glm-4-plus", name: "GLM-4 Plus" }],
+		defaultModel: "glm-5.3-cn",
+		models: [
+			{ id: "glm-5.3-cn", name: "GLM-5.3 (CN)" },
+			{ id: "glm-flash-cn", name: "GLM-Flash (CN)" },
+		],
 	};
 
 	private accessToken: string | null = null;
