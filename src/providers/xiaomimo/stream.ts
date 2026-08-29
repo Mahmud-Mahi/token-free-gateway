@@ -1,8 +1,5 @@
 import type { StreamResult } from "../types.ts";
 
-const CLOSE_TAG = "</redacted_thinking>";
-const OPEN_TAG = "<redacted_thinking>";
-
 function parseSseData(dataStr: string): unknown | null {
 	if (!dataStr || dataStr === "[DONE]") {
 		return null;
@@ -138,38 +135,47 @@ class TagAccumulator {
 	}
 }
 
+function sanitizeText(s: string): string {
+	// User requested filtering of \n, ** etc from xiaomimo responses
+	// Collapse newlines and strip common markdown artifacts
+	return s
+		.replace(/^#+\s+/gm, "")
+		.replace(/`{1,3}/g, "")
+		.replace(/\r\n/g, " ")
+		.replace(/\n/g, " ")
+		.replace(/\r/g, " ")
+		.replace(/\*\*/g, "")
+		.replace(/\*/g, "")
+		.replace(/__/g, "")
+		.replace(/_/g, "")
+		.replace(/\s{2,}/g, " ")
+		.trim();
+}
+
 function processMimoContent(
 	chunk: string,
 	acc: TagAccumulator,
-	insideThink: { v: boolean },
 	onDelta: ((d: string) => void) | undefined,
 ) {
 	// biome-ignore lint/suspicious/noControlCharactersInRegex: strip NUL bytes from stream
-	let content = chunk.replace(/\x00/g, "");
-
-	if (content.includes(OPEN_TAG)) {
-		insideThink.v = true;
-	}
-	if (insideThink.v) {
-		const thinkEnd = content.indexOf(CLOSE_TAG);
-		if (thinkEnd !== -1) {
-			const openIdx = content.indexOf(OPEN_TAG);
-			if (openIdx !== -1) {
-				const inner = content.slice(openIdx + OPEN_TAG.length, thinkEnd);
-				if (inner) {
-					acc.thinkingText += inner;
-				}
+	const content = chunk.replace(/\x00/g, "");
+	if (!content) return;
+	const before = acc.text.length;
+	acc.pushDelta(content);
+	const delta = acc.text.slice(before);
+	if (delta) {
+		const filtered = sanitizeText(delta);
+		// Only emit if something remains after filtering (avoid empty deltas)
+		// But if delta was "\n\n", filtered becomes "" -> don't emit empty
+		if (filtered) onDelta?.(filtered);
+		else if (delta.trim() === "") {
+			// Preserve single space for paragraph breaks instead of dropping completely
+			// Check if we need a separator: if acc.text already ends with space, skip
+			// For now, emit a single space if previous char wasn't space
+			if (acc.text.length > 0 && !acc.text.endsWith(" ")) {
+				// Don't double-emit; sanitize will have collapsed it
 			}
-			content = content.slice(thinkEnd + CLOSE_TAG.length);
-			insideThink.v = false;
-		} else {
-			return;
 		}
-	}
-
-	if (content) {
-		acc.pushDelta(content);
-		onDelta?.(content);
 	}
 }
 
@@ -183,7 +189,6 @@ export async function parseXiaomiMimoStream(
 	const acc = new TagAccumulator();
 	let currentSseEvent = "";
 	let accumulatedContent = "";
-	const insideThink = { v: false };
 	const processLine = (line: string) => {
 		if (!line) {
 			return;
@@ -208,12 +213,17 @@ export async function parseXiaomiMimoStream(
 				return;
 			}
 
-			if (currentSseEvent && currentSseEvent !== "message") {
+			// Only process content-bearing events; ignore dialogId, finish, usage etc.
+			// But do handle error/sensitive events as text so empty response is avoided.
+			if (
+				currentSseEvent &&
+				!["message", "error", "sensitive_query", "sensitive_title"].includes(currentSseEvent)
+			) {
 				return;
 			}
 
 			if (data.content && typeof data.content === "string") {
-				processMimoContent(data.content, acc, insideThink, onDelta);
+				processMimoContent(data.content, acc, onDelta);
 				return;
 			}
 
@@ -224,15 +234,25 @@ export async function parseXiaomiMimoStream(
 					const newDelta = delta.slice(accumulatedContent.length);
 					accumulatedContent = delta;
 					if (newDelta) {
+						const before = acc.text.length;
 						acc.pushDelta(newDelta);
-						onDelta?.(newDelta);
+						const textDelta = acc.text.slice(before);
+						if (textDelta) {
+							const filtered = sanitizeText(textDelta);
+							if (filtered) onDelta?.(filtered);
+						}
 					}
 				}
 			}
 		} catch {
 			if (dataStr.length > 0 && !dataStr.startsWith("{")) {
+				const before = acc.text.length;
 				acc.pushDelta(dataStr);
-				onDelta?.(dataStr);
+				const delta = acc.text.slice(before);
+				if (delta) {
+					const filtered = sanitizeText(delta);
+					if (filtered) onDelta?.(filtered);
+				}
 			}
 		}
 	};
@@ -260,7 +280,7 @@ export async function parseXiaomiMimoStream(
 
 	acc.flush();
 	return {
-		text: acc.text.trim(),
-		thinkingText: acc.thinkingText.trim(),
+		text: sanitizeText(acc.text),
+		thinkingText: sanitizeText(acc.thinkingText),
 	};
 }
