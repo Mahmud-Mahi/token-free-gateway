@@ -188,14 +188,26 @@ function processLine(line: string, acc: TagAccumulator, onDelta?: (delta: string
 	}
 
 	const d = data as Record<string, unknown>;
-	const choices = d.choices as Array<{ delta?: { content?: string } }> | undefined;
+	const choices = d.choices as Array<{ delta?: { content?: string; phase?: string } }> | undefined;
+	const rawDelta = choices?.[0]?.delta;
 	const delta =
-		choices?.[0]?.delta?.content ??
+		rawDelta?.content ??
 		(typeof d.text === "string" ? d.text : undefined) ??
 		(typeof d.content === "string" ? d.content : undefined) ??
 		(typeof d.delta === "string" ? d.delta : undefined);
+	const phase = rawDelta?.phase ?? (typeof d.phase === "string" ? d.phase : undefined);
 
 	if (typeof delta === "string" && delta) {
+		// Route thinking phase to thinkingText, don't stream it as answer content
+		if (phase === "think") {
+			acc.pushDelta(delta, "thinking");
+			return;
+		}
+		// Also handle legacy "Thinking Process:" prefix without phase tag as thinking
+		if (!phase && delta.startsWith("Thinking Process:")) {
+			acc.pushDelta(delta, "thinking");
+			return;
+		}
 		acc.pushDelta(delta);
 		onDelta?.(delta);
 	}
