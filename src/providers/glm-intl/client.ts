@@ -10,13 +10,81 @@ import { parseGlmIntlStream } from "./stream.ts";
 export class GlmIntlWebClient extends BaseDomClient<GlmIntlWebAuth> {
 	readonly providerId = "glm-intl-web";
 
+	private static isRealContent(text: string): boolean {
+		if (!text || text.length < 2) return false;
+		const rawLower = text
+			.toLowerCase()
+			.trim()
+			.replace(/[\u200B-\u200D\uFEFF]/g, "")
+			.replace(/\s+/g, " ");
+		const thinkingOnly = [
+			"thinking...",
+			"thinking…",
+			"thinking",
+			"思考中",
+			"thought process",
+			"analyzing...",
+			"processing...",
+			"let me think",
+		];
+		for (const p of thinkingOnly) {
+			if (
+				rawLower === p ||
+				rawLower.startsWith(`${p}\n`) ||
+				rawLower.startsWith(`${p}\r`) ||
+				rawLower.startsWith(`${p} `)
+			) {
+				return false;
+			}
+		}
+		const stripped = GlmIntlWebClient.stripThinkingText(text);
+		return stripped.length >= 2;
+	}
+
+	private static stripThinkingText(text: string): string {
+		let result = text
+			.replace(/<redacted_thinking>[\s\S]*?<\/redacted_thinking>/gi, "")
+			.replace(/<think>[\s\S]*?<\/think>/gi, "")
+			.replace(/^[\s\S]*?<\/think>\s*/gi, "")
+			.replace(/^Thought\s*Process\s*:?\s*/im, "")
+			.replace(/\n{3,}/g, "\n\n")
+			.trim();
+		const lower = result
+			.toLowerCase()
+			.trim()
+			.replace(/[\u200B-\u200D\uFEFF]/g, "")
+			.replace(/\s+/g, " ");
+		const thinkPrefixes = [
+			"thinking...",
+			"thinking…",
+			"thinking",
+			"思考中",
+			"thought process",
+			"analyzing...",
+			"processing...",
+			"let me think",
+		];
+		for (const prefix of thinkPrefixes) {
+			if (lower === prefix || lower.startsWith(`${prefix}\n`) || lower.startsWith(`${prefix} `)) {
+				result = result
+					.slice(prefix.length)
+					.replace(/^[\s:]+\n?/, "")
+					.trim();
+				break;
+			}
+		}
+		return result;
+	}
+
 	protected readonly config: DomClientConfig = {
 		hostKey: "chat.z.ai",
 		startUrl: "https://chat.z.ai/",
 		cookieDomain: ".z.ai",
 		models: [
-			{ id: "glm-4-plus", name: "GLM-4 Plus" },
-			{ id: "glm-4-think", name: "GLM-4 Think" },
+			{ id: "glm-5.3-flash-intl", name: "GLM-5.3-Flash (Intl)" },
+			{ id: "glm-5.3-intl", name: "GLM-5.3 (Intl)" },
+			{ id: "glm-5.2-intl", name: "GLM-5.2 (Intl)" },
+			{ id: "glm-5-turbo-intl", name: "GLM-5-Turbo (Intl)" },
 		],
 		pollIntervalMs: 900,
 		maxWaitMs: 120_000,
@@ -32,7 +100,22 @@ export class GlmIntlWebClient extends BaseDomClient<GlmIntlWebAuth> {
 			await page.goto("https://chat.z.ai/", { waitUntil: "domcontentloaded", timeout: 120000 });
 		}
 
-		const beforeCount = await page.locator(".chat-assistant").count();
+		const beforeCount = await page.evaluate(() => {
+			const selectors = [
+				".chat-assistant",
+				".assistant-message",
+				".message-assistant",
+				"[data-role='assistant']",
+				".chat-message",
+				".conversation-turn",
+			];
+			let maxCount = 0;
+			for (const sel of selectors) {
+				const count = document.querySelectorAll(sel).length;
+				if (count > maxCount) maxCount = count;
+			}
+			return maxCount;
+		});
 
 		let sent = false;
 		const textarea = page.locator("textarea").first();
@@ -72,19 +155,79 @@ export class GlmIntlWebClient extends BaseDomClient<GlmIntlWebAuth> {
 
 		await page
 			.waitForFunction(
-				(prev) => document.querySelectorAll(".chat-assistant").length > prev,
+				(prev) => {
+					const selectors = [
+						".chat-assistant",
+						".assistant-message",
+						".message-assistant",
+						"[data-role='assistant']",
+						".chat-message:last-child",
+						".conversation-turn:last-child .content",
+					];
+					for (const sel of selectors) {
+						if (document.querySelectorAll(sel).length > prev) return true;
+					}
+					return false;
+				},
 				beforeCount,
 				{ timeout: 120000, polling: 500 },
 			)
 			.catch(() => {});
 
-		return this.pollForStableText(async () => {
-			return page.evaluate(() => {
-				const nodes = Array.from(document.querySelectorAll(".chat-assistant"));
-				const latest = nodes[nodes.length - 1] as HTMLElement | undefined;
-				return (latest?.innerText ?? "").trim();
-			});
-		}, params.signal);
+		const raw = await this.pollForStableText(
+			async () => {
+				return page.evaluate(() => {
+					const selectors = [
+						".chat-assistant",
+						".assistant-message",
+						".message-assistant",
+						"[data-role='assistant']",
+						".chat-message:last-child",
+						".conversation-turn:last-child .content",
+					];
+					let latest: HTMLElement | null = null;
+					for (const sel of selectors) {
+						const nodes = Array.from(document.querySelectorAll(sel));
+						if (nodes.length > 0) {
+							latest = nodes[nodes.length - 1] as HTMLElement;
+							break;
+						}
+					}
+					if (!latest) return "";
+					const text = (latest.innerText ?? "").trim();
+					if (!text) return "";
+					const lower = text
+						.toLowerCase()
+						.replace(/[\u200B-\u200D\uFEFF]/g, "")
+						.replace(/\s+/g, " ")
+						.trim();
+					const thinkLabels = [
+						"thought process",
+						"thinking...",
+						"thinking…",
+						"thinking",
+						"思考中",
+						"analyzing...",
+						"processing...",
+						"let me think",
+					];
+					for (const label of thinkLabels) {
+						if (lower.startsWith(label)) {
+							const afterThink = text
+								.slice(label.length)
+								.replace(/^[\s:]+\n?/, "")
+								.trim();
+							if (afterThink) return afterThink;
+							return "";
+						}
+					}
+					return text;
+				});
+			},
+			params.signal,
+			GlmIntlWebClient.isRealContent,
+		);
+		return GlmIntlWebClient.stripThinkingText(raw);
 	}
 
 	protected parseStreamImpl(
