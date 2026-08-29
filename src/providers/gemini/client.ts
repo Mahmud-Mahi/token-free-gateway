@@ -19,8 +19,9 @@ export class GeminiWebClient extends BaseDomClient<GeminiWebAuth> {
 		startUrl: "https://gemini.google.com/app",
 		cookieDomain: ".google.com",
 		models: [
-			{ id: "gemini-pro", name: "Gemini Pro (Web)" },
-			{ id: "gemini-ultra", name: "Gemini Ultra (Web)" },
+			{ id: "gemini-3.5-flash-lite", name: "Gemini 3.5 Flash Lite" },
+			{ id: "gemini-3.6-flash", name: "Gemini 3.6 Flash" },
+			{ id: "gemini-3.1-pro", name: "Gemini 3.1 Pro" },
 		],
 		pollIntervalMs: 2000,
 		maxWaitMs: 120_000,
