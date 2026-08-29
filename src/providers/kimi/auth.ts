@@ -40,7 +40,7 @@ export async function loginKimiWeb(params: {
 	const page = context.pages()[0] || (await context.newPage());
 
 	params.onProgress("Navigating to Kimi...");
-	await page.goto("https://www.kimi.com/", { waitUntil: "domcontentloaded" });
+	await page.goto("https://www.kimi.ai/", { waitUntil: "domcontentloaded" });
 
 	params.onProgress("Please login in the browser window...");
 	params.onProgress("Waiting for authentication...");
