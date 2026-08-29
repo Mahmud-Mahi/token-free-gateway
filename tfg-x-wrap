@@ -1,0 +1,484 @@
+#!/usr/bin/env python3
+"""Expose a local OpenAI-compatible API through a Cloudflare quick tunnel and
+register it as a Warp custom model endpoint (base URL, API key, models).
+
+Warp stores custom endpoints in the OS keyring (Secret Service) under the
+"AiApiKeys" key of the app's namespace. This script upserts an endpoint there
+directly, targeting official stable Warp (dev.warp.Warp), without touching the
+settings UI.
+
+Usage:
+  tfg-x-wrap [up] [--model NAME]... [options]
+  tfg-x-wrap --models [--port PORT] [--api-key KEY]
+  tfg-x-wrap down
+  tfg-x-wrap status
+
+Commands:
+  up       Start (or reuse) the tunnel and update the Warp endpoint. Default.
+  down     Stop the tunnel started by this script.
+  status   Show tunnel URL, process state, and the stored endpoint.
+
+Options:
+  --port PORT       local API port (default 3456)
+  --api-key KEY     API key Warp will send as Bearer (default: any-string)
+  --model NAME      model id to register; repeatable (default: deepseek-chat)
+  --models          print all available model ids from the local API and exit
+  --name NAME       display name for the endpoint (default: Local Tunnel)
+  --schema SCHEMA   openai_chat_completions (default) | openai_responses |
+                    anthropic_messages
+  --no-v1           store base URL without the /v1 suffix
+  --no-health-check skip the local API reachability check
+  --foreground      keep the tunnel attached to this terminal (Ctrl-C stops it)
+  --restart         restart Warp so it reloads the keyring
+
+The tunnel URL changes on every restart, so run `up` again after reboots or
+after `down`. Warp only reads the keyring at startup: restart it (or pass
+--restart) after updating.
+"""
+
+import argparse
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+import uuid
+from urllib import error as urllib_error
+from urllib import request as urllib_request
+
+
+def _require_secretstorage():
+    try:
+        import secretstorage
+    except ImportError as exc:
+        raise RuntimeError(
+            "python secretstorage module missing: "
+            "pip3 install --user --break-system-packages secretstorage"
+        ) from exc
+    return secretstorage
+
+TUNNEL_LOG = os.path.join(tempfile.gettempdir(), "tfg-x-wrap-tunnel.log")
+TUNNEL_PID = os.path.join(tempfile.gettempdir(), "tfg-x-wrap-tunnel.pid")
+TUNNEL_URL_RE = re.compile(r"https://[a-z0-9-]+\.trycloudflare\.com")
+
+APPS = {
+    "stable": {"service": "dev.warp.Warp", "binary": "/opt/warpdotdev/warp-terminal/warp"},
+}
+AI_KEYS = "AiApiKeys"
+SCHEMAS = ("openai_chat_completions", "openai_responses", "anthropic_messages")
+
+def start_token_free_gateway():
+    print("[token-free-gateway] Starting Chrome with debug profile...")
+
+    # Step 1: Start Chrome via the gateway CLI, then wait 45 seconds for it
+    # to come up fully before running the web auth flow.
+    try:
+        subprocess.run(
+            ["token-free-gateway", "chrome", "start"],
+            check=True,
+        )
+    except subprocess.CalledProcessError as e:
+        sys.exit(f"[token-free-gateway] chrome start failed with exit code {e.returncode}")
+    except FileNotFoundError:
+        sys.exit("[token-free-gateway] 'token-free-gateway' command not found")
+
+    print("[token-free-gateway] Waiting 45 seconds for Chrome to start...")
+    time.sleep(45)
+
+    # Step 2: Run the web auth flow and answer its selection prompt.
+    selection = "a"
+
+    try:
+        # text=True allows passing string input directly. We wait 2 seconds
+        # after webauth starts, then send the selection followed by Enter.
+        # (stdin is piped, so the CLI reads the buffered line when its
+        # selection prompt appears.)
+        proc = subprocess.Popen(
+            ["token-free-gateway", "webauth"],
+            stdin=subprocess.PIPE,
+            text=True,
+        )
+        time.sleep(2)
+        try:
+            out, _ = proc.communicate(input=f"{selection}\n", timeout=600)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            sys.exit("[token-free-gateway] webauth timed out after 600s")
+        if proc.returncode != 0:
+            sys.exit(f"[token-free-gateway] webauth failed with exit code {proc.returncode}")
+    except FileNotFoundError:
+        sys.exit("[token-free-gateway] 'token-free-gateway' command not found")
+
+    # Give the webauth flow a moment to process the selection before
+    # continuing (per spec: wait 2 seconds after webauth starts).
+    time.sleep(2)
+
+    print(f"[token-free-gateway] Selected: {selection}")
+
+    # Step 3: Run background process
+    print("[token-free-gateway] Starting token-free-gateway background service...")
+    subprocess.Popen(["token-free-gateway", "start"], start_new_session=True)
+    time.sleep(3)
+
+def tunnel_url_from_log():
+    try:
+        with open(TUNNEL_LOG, "r", errors="replace") as f:
+            m = TUNNEL_URL_RE.search(f.read())
+            return m.group(0) if m else None
+    except FileNotFoundError:
+        return None
+
+
+def tunnel_pid_alive():
+    try:
+        with open(TUNNEL_PID) as f:
+            pid = int(f.read().strip())
+        os.kill(pid, 0)
+        return pid
+    except (FileNotFoundError, ValueError, ProcessLookupError, PermissionError):
+        return None
+
+
+def start_tunnel(port, foreground):
+    pid = tunnel_pid_alive()
+    url = tunnel_url_from_log()
+    if pid and url:
+        print(f"[tunnel] reusing running tunnel {url}")
+        return url
+
+    for stale in (TUNNEL_LOG, TUNNEL_PID):
+        try:
+            os.unlink(stale)
+        except FileNotFoundError:
+            pass
+
+    log = open(TUNNEL_LOG, "w")
+    proc = subprocess.Popen(
+        ["cloudflared", "tunnel", "--url", f"http://localhost:{port}"],
+        stdout=log, stderr=subprocess.STDOUT,
+        start_new_session=not foreground,
+    )
+    with open(TUNNEL_PID, "w") as f:
+        f.write(str(proc.pid))
+
+    deadline = time.time() + 45
+    while time.time() < deadline:
+        url = tunnel_url_from_log()
+        if url:
+            print(f"[tunnel] started {url}")
+            return url
+        if proc.poll() is not None:
+            with open(TUNNEL_LOG, errors="replace") as f:
+                sys.exit(f"[tunnel] cloudflared exited early:\n{f.read()}")
+        time.sleep(0.5)
+    stop_tunnel()
+    sys.exit("[tunnel] timed out waiting for the trycloudflare.com URL")
+
+
+def stop_tunnel():
+    pid = tunnel_pid_alive()
+    if pid:
+        os.kill(pid, signal.SIGTERM)
+        print(f"[tunnel] stopped (pid {pid})")
+    for stale in (TUNNEL_LOG, TUNNEL_PID):
+        try:
+            os.unlink(stale)
+        except FileNotFoundError:
+            pass
+
+
+def health_check(port, api_key):
+    cmd = ["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
+           "--max-time", "5", "-H", f"Authorization: Bearer {api_key}",
+           f"http://localhost:{port}/v1/models"]
+    try:
+        code = subprocess.run(cmd, capture_output=True, text=True).stdout.strip()
+    except FileNotFoundError:
+        print("[api] curl not found; skipping health check")
+        return
+    if code == "200":
+        print(f"[api] localhost:{port} is up and accepts the API key")
+    elif code == "401":
+        sys.exit(f"[api] localhost:{port} rejects the API key (401). "
+                 "Fix with: --api-key <the-key-your-api-expects>")
+    else:
+        print(f"[api] warning: localhost:{port}/v1/models returned HTTP {code} "
+              "(continuing anyway)")
+
+
+def api_healthy(port, api_key):
+    try:
+        names = fetch_models(port, api_key)
+    except ValueError:
+        return False
+    return bool(names)
+
+
+def token_free_gateway_running():
+    try:
+        out = subprocess.run(["pgrep", "-x", "token-free-gateway"],
+                            capture_output=True, text=True)
+    except FileNotFoundError:
+        return False
+    return bool(out.stdout.strip())
+
+
+def maybe_start_token_free_gateway(args):
+    if api_healthy(args.port, args.api_key):
+        print("[token-free-gateway] local API is already healthy; skipping webauth")
+        return
+    if token_free_gateway_running():
+        print("[token-free-gateway] already running; skipping webauth")
+        return
+    start_token_free_gateway()
+
+
+def fetch_models(port, api_key, timeout=10):
+    url = f"http://localhost:{port}/v1/models"
+    req = urllib_request.Request(url, headers={"Authorization": f"Bearer {api_key}"})
+    try:
+        with urllib_request.urlopen(req, timeout=timeout) as resp:
+            payload = json.load(resp)
+    except urllib_error.HTTPError as exc:
+        if exc.code == 401:
+            raise ValueError(f"localhost:{port} rejects the API key (401). "
+                             "Fix with: --api-key <the-key-your-api-expects>") from exc
+        raise ValueError(f"localhost:{port}/v1/models returned HTTP {exc.code}") from exc
+    except Exception as exc:  # pragma: no cover - diagnostic path
+        raise ValueError(f"could not read model list from http://localhost:{port}/v1/models: {exc}") from exc
+
+    if isinstance(payload, dict):
+        candidates = [payload.get("data"), payload.get("models")]
+        for item in candidates:
+            if isinstance(item, list):
+                return _normalize_model_names(item)
+        if isinstance(payload.get("object"), str) and payload.get("object") == "list":
+            data = payload.get("data", [])
+            if isinstance(data, list):
+                return _normalize_model_names(data)
+    elif isinstance(payload, list):
+        return _normalize_model_names(payload)
+    return []
+
+
+def _normalize_model_names(items):
+    names = []
+    for item in items:
+        if isinstance(item, dict):
+            name = item.get("id") or item.get("name") or item.get("model")
+            if name:
+                names.append(str(name))
+        elif isinstance(item, str):
+            names.append(item)
+    return names
+
+
+def cmd_models(args):
+    try:
+        names = fetch_models(args.port, args.api_key)
+    except ValueError as exc:
+        sys.exit(str(exc))
+    if not names:
+        print(f"[api] no models returned from localhost:{args.port}/v1/models")
+        return
+    print("Available models:")
+    for name in names:
+        print(f"- {name}")
+
+
+def read_keyring_json(service):
+    secretstorage = _require_secretstorage()
+    conn = secretstorage.dbus_init()
+    coll = secretstorage.get_default_collection(conn)
+    if coll.is_locked():
+        coll.unlock()
+    for item in coll.get_all_items():
+        attrs = item.get_attributes()
+        if attrs.get("service") == service and attrs.get("key") == AI_KEYS:
+            return json.loads(item.get_secret().decode())
+    return None
+
+
+def write_keyring_json(service, data):
+    secretstorage = _require_secretstorage()
+    conn = secretstorage.dbus_init()
+    coll = secretstorage.get_default_collection(conn)
+    if coll.is_locked():
+        coll.unlock()
+    coll.create_item(
+        f"{service}: {AI_KEYS}",
+        {"service": service, "key": AI_KEYS, "xdg:schema": "org.freedesktop.Secret.Generic"},
+        json.dumps(data).encode(),
+        replace=True,
+        content_type="text/plain",
+    )
+
+
+def is_our_endpoint(ep, port):
+    host = ep.get("url", "")
+    return (".trycloudflare.com" in host
+            or f"//localhost:{port}" in host
+            or "//127.0.0.1" in host)
+
+
+def upsert_endpoint(data, base_url, args):
+    endpoints = data.setdefault("custom_endpoints", [])
+    ep = next((e for e in endpoints if e.get("name") == args.name), None)
+    if ep is None:
+        ep = next((e for e in endpoints if is_our_endpoint(e, args.port)), None)
+    if ep is None:
+        ep = {"name": args.name}
+        endpoints.append(ep)
+        print(f"[keyring] creating endpoint '{args.name}'")
+    else:
+        print(f"[keyring] updating existing endpoint '{ep.get('name')}'")
+
+    old_models = {m.get("name"): m.get("config_key") for m in ep.get("models", [])}
+    ep.update({
+        "name": ep.get("name") or args.name,
+        "url": base_url,
+        "api_key": args.api_key,
+        "schema": args.schema,
+        "models": [{
+            "name": name,
+            "alias": None,
+            "config_key": old_models.get(name) or str(uuid.uuid4()),
+        } for name in args.models],
+    })
+    return ep
+
+
+def app_running():
+    # The main process rewrites its argv to "warp-terminal", so match by name,
+    # not by the full binary path (children keep the path in their argv).
+    try:
+        out = subprocess.run(["pgrep", "-x", "warp-terminal"], capture_output=True, text=True)
+        return bool(out.stdout.strip())
+    except FileNotFoundError:
+        return False
+
+
+def stop_app():
+    subprocess.run(["pkill", "-x", "warp-terminal"], capture_output=True)
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        if not app_running():
+            print("[warp] stopped")
+            return
+        time.sleep(0.3)
+    subprocess.run(["pkill", "-9", "-x", "warp-terminal"], capture_output=True)
+    time.sleep(1)
+    print("[warp] force-stopped")
+
+
+def launch_app():
+    binary = APPS["stable"]["binary"]
+    subprocess.Popen([binary], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                     start_new_session=True)
+    print(f"[warp] launched {binary}")
+
+
+def cmd_up(args):
+    if not args.no_health_check:
+        if api_healthy(args.port, args.api_key):
+            print(f"[api] localhost:{args.port} is already healthy")
+        else:
+            health_check(args.port, args.api_key)
+
+    if tunnel_pid_alive() and tunnel_url_from_log():
+        url = tunnel_url_from_log()
+        print(f"[tunnel] reusing running tunnel {url}")
+    else:
+        url = start_tunnel(args.port, args.foreground)
+    base_url = url if args.no_v1 else f"{url}/v1"
+
+    # Stop Warp before writing so a stale in-memory copy can't clobber the
+    # keyring afterwards; the fresh instance then loads our endpoint.
+    if args.restart and app_running():
+        stop_app()
+
+    maybe_start_token_free_gateway(args)
+
+    service = APPS["stable"]["service"]
+    data = read_keyring_json(service) or {}
+    ep = upsert_endpoint(data, base_url, args)
+    write_keyring_json(service, data)
+    models = ", ".join(m["name"] for m in ep["models"])
+    print(f"[keyring] {service}: url={ep['url']} key={ep['api_key']} models=[{models}] schema={ep['schema']}")
+
+    if args.restart:
+        launch_app()
+    elif app_running():
+        print("[warp] Warp is running and will not see the change until restarted "
+              "(re-run with --restart to do it automatically)")
+    else:
+        print("[warp] Warp is not running; it will pick up the endpoint on next launch")
+
+    if args.foreground:
+        print("[tunnel] foreground mode: Ctrl-C to stop the tunnel")
+        try:
+            subprocess.run(["cloudflared", "--version"], capture_output=True)  # cheap no-op wait
+            while tunnel_pid_alive():
+                time.sleep(1)
+        except KeyboardInterrupt:
+            stop_tunnel()
+
+
+def cmd_status(args):
+    pid = tunnel_pid_alive()
+    url = tunnel_url_from_log()
+    print(f"tunnel: {'running' if pid else 'stopped'}"
+          f"{f' (pid {pid})' if pid else ''} {url or ''}")
+    for app, cfg in APPS.items():
+        data = read_keyring_json(cfg["service"])
+        if not data:
+            print(f"{cfg['service']}: no AiApiKeys entry")
+            continue
+        for ep in data.get("custom_endpoints", []):
+            models = ", ".join(m.get("name", "?") for m in ep.get("models", []))
+            print(f"{cfg['service']}: '{ep.get('name')}' -> {ep.get('url')} [{models}]")
+
+
+def main():
+    parser = argparse.ArgumentParser(add_help=True, description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("command", nargs="?", choices=["up", "down", "status"])
+    parser.add_argument("--port", type=int, default=3456)
+    parser.add_argument("--api-key", default="any-string")
+    parser.add_argument("--model", action="append", dest="model_names")
+    parser.add_argument("--models", action="store_true",
+                        help="print the model ids available from the local API and exit")
+    parser.add_argument("--name", default="Local Tunnel")
+    parser.add_argument("--schema", default="openai_chat_completions", choices=SCHEMAS)
+    parser.add_argument("--no-v1", action="store_true")
+    parser.add_argument("--no-health-check", action="store_true")
+    parser.add_argument("--foreground", action="store_true")
+    parser.add_argument("--restart", action="store_true")
+    args = parser.parse_args()
+
+    if args.models:
+        cmd_models(args)
+        return
+
+    if args.command is None:
+        args.command = "up"
+    if args.model_names:
+        args.models = args.model_names
+    elif not hasattr(args, "models") or not args.models:
+        args.models = ["copilot-search"]
+    if args.schema not in SCHEMAS:
+        parser.error(f"schema must be one of {SCHEMAS}")
+
+    if args.command == "up":
+        cmd_up(args)
+    elif args.command == "down":
+        stop_tunnel()
+    elif args.command == "status":
+        cmd_status(args)
+
+
+if __name__ == "__main__":
+    main()
