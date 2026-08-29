@@ -6,15 +6,6 @@ export interface BrowserCookie {
 	secure?: boolean;
 }
 
-/**
- * Parse a raw `Cookie` header string into an array of browser-cookie
- * objects suitable for `BrowserManager.addCookies()`.
- *
- * Handles values containing `=` (e.g. base64 tokens) by rejoining
- * everything after the first `=`.  Skips fragments without `=` and
- * entries whose name is empty.  JSON-shaped strings (`{...}`) are
- * rejected early — callers should pre-parse those.
- */
 export function parseCookieHeader(cookieStr: string, domain: string): BrowserCookie[] {
 	if (!cookieStr?.trim() || cookieStr.startsWith("{")) return [];
 	return cookieStr
@@ -22,9 +13,16 @@ export function parseCookieHeader(cookieStr: string, domain: string): BrowserCoo
 		.filter((c) => c.trim().includes("="))
 		.map((c) => {
 			const [name, ...valueParts] = c.trim().split("=");
+			let value = valueParts.join("=").trim();
+			// Strip surrounding quotes (e.g. xiaomichatbot_serviceToken="...") — the raw Cookie
+			// header stores quoted values, but BrowserContext.addCookies expects raw value without
+			// quotes. Keeping quotes causes the cookie to be set with literal quotes and breaks auth.
+			if (value.length >= 2 && value.startsWith('"') && value.endsWith('"')) {
+				value = value.slice(1, -1);
+			}
 			return {
 				name: name?.trim() ?? "",
-				value: valueParts.join("=").trim(),
+				value,
 				domain,
 				path: "/",
 			};
