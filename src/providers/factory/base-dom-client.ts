@@ -118,10 +118,12 @@ export abstract class BaseDomClient<TAuth = unknown> implements WebProviderClien
 	protected async pollForStableText(
 		extractFn: () => Promise<string>,
 		signal?: AbortSignal,
+		isAcceptableText?: (text: string) => boolean,
 	): Promise<string> {
 		const interval = this.config.pollIntervalMs ?? 2000;
 		const maxWait = this.config.maxWaitMs ?? 120_000;
 		const threshold = this.config.stabilityThreshold ?? 2;
+		const accept = isAcceptableText ?? (() => true);
 
 		let lastText = "";
 		let stableCount = 0;
@@ -135,7 +137,7 @@ export abstract class BaseDomClient<TAuth = unknown> implements WebProviderClien
 				if (text !== lastText) {
 					lastText = text;
 					stableCount = 0;
-				} else {
+				} else if (accept(text)) {
 					stableCount++;
 					if (stableCount >= threshold) break;
 				}
