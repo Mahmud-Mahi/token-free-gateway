@@ -2,9 +2,70 @@
 
 **[中文文档](README_zh-CN.md)**
 
-Use ChatGPT, Claude, Gemini, DeepSeek, and 9 more AI models — **completely free, no API keys required**. Just log in via browser.
+Use ChatGPT, Claude, Gemini, DeepSeek, and 10 more AI models — **completely free, no API keys required**. Just log in via browser.
 
 Token-Free Gateway is a lightweight OpenAI-compatible API server that turns web-based AI sessions into a standard `/v1/chat/completions` endpoint with full **Tools / Function Calling** support. Point any OpenAI SDK client at it and it just works.
+
+## What's New in This Version
+
+This release updates the provider lineup, improves reasoning-model support, and hardens browser automation reliability.
+
+### 🔄 Provider Changes
+
+| Change | Details |
+| ------ | ------- |
+| ➕ **New provider: Microsoft Copilot** (`copilot-web`) | Models: `copilot-smart`, `copilot-think-deeper`, `copilot-study`, `copilot-search` |
+| ➕ **New provider: Dola** (`dola-web`) | Models: `dola-fast`, `dola-pro` — replaces the removed Doubao provider |
+| ➖ **Removed: Grok** | The `grok` provider has been dropped from the registry |
+| ➖ **Removed: Doubao** | Replaced by Dola (www.dola.com) |
+| 🔗 **Kimi URL change** | Login domain moved from `www.kimi.com` to `kimi.ai` |
+
+The gateway now supports **14 providers**: Claude, ChatGPT, DeepSeek, Dola, Gemini, GLM, GLM Intl, Copilot, Kimi, Perplexity, Qwen, Qwen CN, Xiaomi MiMo.
+
+### 🧠 Reasoning / Thinking Model Support (OpenAI-compatible)
+
+- Assistant messages and streaming deltas now expose reasoning output through three standard-compatible fields: `reasoning_content`, `reasoning`, and `thinking` (DeepSeek-reasoner style).
+- For **think/reasoner models** (any model ID containing `think` or `reasoner`), streaming uses buffered parsing so `reasoning_content` is emitted **before** content, matching the DeepSeek-reasoner behavior clients expect. Non-reasoning models keep live incremental streaming.
+- Fallback logic ensures `content` is never `null`/empty when a provider puts the answer into the thinking buffer (e.g. missing `</think>` tag) — the thinking text is promoted to content while still being exposed as reasoning.
+- Token accounting now includes thinking text in completion token estimates.
+
+### 🛣️ Smarter Model Resolution
+
+- Model → provider lookup is now **case-insensitive** with exact matching, keeping Qwen CN (`-cn`) and Qwen Intl (`-intl`) variants distinct.
+- **Backward-compatible legacy aliases**: old model IDs without provider suffixes still resolve, e.g. `qwen3.7`, `qwen3.8-max`, `gpt-5`, `gpt-4o`, `gpt-5.6-sol/terra/luna`.
+- **Flexible Claude matching**: any model ID starting with `claude-` routes to the Claude provider, so you can use the exact model ID your account supports.
+
+### 🔍 New Claude Model Discovery Endpoint
+
+`GET /v1/providers/claude-web/discover` — asks the Claude provider which models your account actually has access to, returning:
+
+```json
+{
+  "available_models": [...],
+  "config_models": ["claude-sonnet-4-20250514", ...],
+  "message": "Use these model IDs with the Claude provider"
+}
+```
+
+Returns `404` with a hint to run `token-free-gateway webauth` if Claude is not authorized.
+
+### 📝 Improved `/v1/models` Response
+
+Model list entries now include a human-readable `name` field alongside `id`, `object`, and `owned_by`.
+
+### 🖱️ More Reliable Text Input (React-safe Pasting)
+
+The DOM input layer was reworked to fix a common failure mode where text appeared in the input but React-controlled apps (ChatGPT, Perplexity, …) still "saw" an empty field. The paste strategy is now a three-tier fallback:
+
+1. `document.execCommand("insertText")` — fires a real `input` event that React's synthetic event system picks up.
+2. Synthetic `ClipboardEvent` **plus an explicit `InputEvent`** dispatch so React state syncs.
+3. Real clipboard + Ctrl/Cmd+V as a last resort.
+
+### ⏱️ Configurable Stability Polling
+
+`pollForStableText` in the base DOM client now accepts an optional `isAcceptableText` predicate, so providers can reject intermediate/incomplete responses (e.g. "thinking…" placeholders) and keep polling until genuinely acceptable text is stable.
+
+---
 
 ## Why Token-Free Gateway?
 
@@ -17,7 +78,7 @@ Token-Free Gateway is a lightweight OpenAI-compatible API server that turns web-
 
 ## What You Get
 
-- **One endpoint, 13 providers** — Claude, ChatGPT, DeepSeek, Doubao, Gemini, GLM, GLM Intl, Grok, Kimi, Perplexity, Qwen, Qwen CN, Xiaomi MiMo
+- **One endpoint, 14 providers** — Claude, ChatGPT, DeepSeek, Dola, Gemini, GLM, GLM Intl, Copilot, Kimi, Perplexity, Qwen, Qwen CN, Xiaomi MiMo
 - **100% OpenAI-compatible** — `/v1/chat/completions`, `/v1/models`, streaming, tool_calls — zero client-side changes
 - **Full Function Calling** — tools are injected as prompts, responses are parsed back into standard `tool_calls`
 - **Single binary, batteries included** — `playwright-core` is bundled; the **only** external dependency is Chrome
@@ -34,6 +95,22 @@ That's it. `playwright-core` is bundled in the binary; no `playwright install`, 
 
 > **Does my Chrome version need to "match" something?** — No. The gateway connects to your Chrome's debug WebSocket; CDP stays compatible across recent Chrome versions.
 
+### Recommended Packages
+
+| Package | When needed | Install |
+| ------- | ----------- | ------- |
+| **Chrome / Chromium** | **Required** — browser automation for all providers | [google.com/chrome](https://www.google.com/chrome/) or your OS package manager |
+| **Bun** | Only when building from source / developing (`bun install` / `bun run build`); **not** needed for the prebuilt binary or npm install | `curl -fsSL https://bun.sh/install \| bash` |
+| **cloudflared** | Only for `tfg-x-wrap` — Cloudflare quick tunnel | `brew install cloudflared` (macOS) / `sudo apt install cloudflared` (Debian/Ubuntu) or grab a binary from [GitHub Releases](https://github.com/cloudflare/cloudflared/releases) |
+| **Python 3** | Only for `tfg-x-wrap` (standard library is enough, no venv needed) | Preinstalled on most systems |
+| **python secretstorage** | Only for `tfg-x-wrap` — reads/writes Warp's OS keyring | `pip3 install --user --break-system-packages secretstorage` |
+| **Secret Service keyring daemon** | Only for `tfg-x-wrap` on Linux (e.g. `gnome-keyring` / `kwallet`; preinstalled on most desktop distros) | `sudo apt install gnome-keyring` |
+
+> **Notes:**
+> - With `npm install -g token-free-gateway` or a prebuilt binary, **Chrome is the only external dependency**; `playwright-core` is bundled and no Node.js runtime is needed.
+> - `cloudflared`, Python 3, and `secretstorage` are only needed for the **Warp terminal integration** (`tfg-x-wrap`); skip them if you only use the gateway itself.
+> - Dev tools (Biome, TypeScript) are fetched automatically via `bunx` — no separate installation required.
+
 ---
 
 ## Quick Start
@@ -42,7 +119,7 @@ That's it. `playwright-core` is bundled in the binary; no `playwright install`, 
 
 Choose **one** method:
 
-**Via npm** (recommended):
+**Via npm**:
 
 ```bash
 npm install -g token-free-gateway
@@ -55,7 +132,7 @@ tar xzf token-free-gateway-<platform>.tar.gz
 chmod +x token-free-gateway
 ```
 
-**From source:**
+**From source:** (recommended)
 
 ```bash
 git clone https://github.com/andeya/token-free-gateway.git && cd token-free-gateway
@@ -71,7 +148,7 @@ Run the authorization wizard. Chrome will **start automatically** if it is not a
 token-free-gateway webauth
 ```
 
-Chrome opens with login pages for all 13 providers. Log in to the ones you want, then press **Enter** in the terminal. Select which providers to authorize — credentials are saved to `~/.token-free-gateway/auth-profiles.json`.
+Chrome opens with login pages for all 14 providers. Log in to the ones you want, then press **Enter** in the terminal. Select which providers to authorize — credentials are saved to `~/.token-free-gateway/auth-profiles.json`.
 
 > **DeepSeek:** keep the DeepSeek chat page open while running `webauth` — the wizard captures the bearer token from the live session.
 >
@@ -151,11 +228,11 @@ curl http://localhost:3456/v1/chat/completions \
 | Claude      | `claude-*`      | Session cookie        | CDP (browser fetch)       |
 | ChatGPT     | `chatgpt-*`     | Access token + cookie | CDP (browser fetch)       |
 | DeepSeek    | `deepseek-*`    | Bearer token + cookie | CDP (browser fetch + PoW) |
-| Doubao      | `doubao-*`      | Session cookie        | CDP (browser fetch)       |
+| Doubao → **Dola** | `dola-*`        | Session cookie        | CDP (browser fetch)       |
 | Gemini      | `gemini-*`      | Google SID cookie     | CDP (browser fetch)       |
 | GLM (智谱)  | `glm-*`         | Refresh token cookie  | CDP (browser fetch)       |
 | GLM Intl    | `glm-intl-*`    | Session cookie        | CDP (browser fetch)       |
-| Grok        | `grok-*`        | SSO cookie            | CDP (browser fetch)       |
+| Grok → **Copilot** | `copilot-*`     | Session cookie        | CDP (browser fetch)       |
 | Kimi        | `kimi-*`        | Access token          | CDP (browser fetch)       |
 | Perplexity  | `perplexity-*`  | Next-auth cookie      | CDP (browser fetch)       |
 | Qwen        | `qwen-*`        | Session cookie        | CDP (browser fetch)       |
@@ -252,6 +329,7 @@ TFG_REQUEST_TIMEOUT_SEC=300
 | `POST` | `/v1/chat/completions` | Required | Chat completions (streaming + non-streaming) |
 | `GET`  | `/v1/models`           | Required | List models from authorized providers        |
 | `GET`  | `/v1/models/:id`       | Required | Get model details                            |
+| `GET`  | `/v1/providers/claude-web/discover` | Required | Discover Claude models available to your account (new) |
 | `GET`  | `/health`              | Public   | Health check (browser CDP + session status)  |
 
 > "Required" means the `Authorization: Bearer <TFG_API_KEY>` header is checked **only** when `TFG_API_KEY` is configured. If unset, all endpoints are open.
