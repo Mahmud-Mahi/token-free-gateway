@@ -40,9 +40,13 @@ export async function loginQwenWeb(params: {
 	if (!context) {
 		throw new Error("No browser context available");
 	}
-	const page = context.pages()[0] || (await context.newPage());
-
-	await page.goto("https://chat.qwen.ai/");
+	// Reuse an existing chat.qwen.ai tab instead of navigating pages()[0]
+	// (which hijacks whatever tab happens to be first and creates duplicates).
+	const existingPage = context.pages().find((p) => p.url().includes("chat.qwen.ai"));
+	let page = existingPage ?? (await context.newPage());
+	if (!page.url().includes("chat.qwen.ai")) {
+		await page.goto("https://chat.qwen.ai/");
+	}
 	const userAgent = await page.evaluate(() => navigator.userAgent);
 
 	params.onProgress("Please login to Qwen in the opened browser window...");
@@ -56,6 +60,31 @@ export async function loginQwenWeb(params: {
 				reject(new Error("Login timed out (5 minutes)."));
 			}
 		}, 300_000);
+
+		// chat.qwen.ai keeps its session token in localStorage under "token"
+		// (it is no longer exposed as a cookie). Read it in-page.
+		const readLocalStorageToken = async (): Promise<string | undefined> => {
+			try {
+				const token = await page.evaluate(() => {
+					const direct = localStorage.getItem("token");
+					if (direct) return direct;
+					// Fall back to scanning for any token-like entry
+					for (let i = 0; i < localStorage.length; i++) {
+						const key = localStorage.key(i);
+						if (!key) continue;
+						const lower = key.toLowerCase();
+						if (lower.includes("token") || lower.includes("session") || lower.includes("auth")) {
+							const value = localStorage.getItem(key);
+							if (value && value.length > 20) return value;
+						}
+					}
+					return null;
+				});
+				return token || undefined;
+			} catch {
+				return undefined;
+			}
+		};
 
 		const tryResolve = async () => {
 			if (resolved) {
@@ -72,59 +101,40 @@ export async function loginQwenWeb(params: {
 				const cookieNames = cookies.map((c) => c.name);
 				console.log(`[Qwen] Found cookies: ${cookieNames.join(", ")}`);
 
-				const sessionCookie = cookies.find(
-					(c) => c.name.includes("session") || c.name.includes("token") || c.name.includes("auth"),
-				);
+				const localStorageToken = await readLocalStorageToken();
+				const finalToken = capturedToken || localStorageToken || "";
 
-				if (sessionCookie || capturedToken) {
-					const finalToken = capturedToken || sessionCookie?.value || "";
+				if (finalToken && cookies.length > 2) {
+					resolved = true;
+					clearTimeout(timeout);
+					console.log(`[Qwen] Session token captured!`);
 
-					if (finalToken && cookies.length > 2) {
-						resolved = true;
-						clearTimeout(timeout);
-						console.log(`[Qwen] Session token captured!`);
+					const cookieString = cookies.map((c) => `${c.name}=${c.value}`).join("; ");
 
-						const cookieString = cookies.map((c) => `${c.name}=${c.value}`).join("; ");
-
-						resolve({
-							sessionToken: finalToken,
-							cookie: cookieString,
-							userAgent,
-						});
-					} else {
-						console.log(`[Qwen] Waiting for valid session...`);
-					}
+					resolve({
+						sessionToken: finalToken,
+						cookie: cookieString,
+						userAgent,
+					});
 				} else {
-					console.log(`[Qwen] Waiting for session cookie...`);
+					console.log(`[Qwen] Waiting for session token (localStorage/Authorization)...`);
 				}
 			} catch (e: unknown) {
 				console.error(`[Qwen] Failed to fetch cookies: ${String(e)}`);
 			}
 		};
 
-		page.on("request", async (request) => {
-			const url = request.url();
-			if (url.includes("qwen.ai")) {
-				const headers = request.headers();
-				const auth = headers.authorization;
-				const cookie = headers.cookie;
-
-				if (auth) {
-					if (!capturedToken) {
-						console.log(`[Qwen] Captured authorization token from request.`);
-						capturedToken = auth.replace("Bearer ", "");
-					}
-					await tryResolve();
-				} else if (cookie) {
-					const tokenMatch = cookie.match(/(?:session|token|auth)[^=]*=([^;]+)/i);
-					if (tokenMatch) {
-						if (!capturedToken) {
-							console.log(`[Qwen] Captured session from cookie.`);
-							capturedToken = tokenMatch[1];
-						}
-						await tryResolve();
-					}
+		// Capture the Bearer token the SPA sends on API requests (context-wide,
+		// so login flows in other qwen tabs are caught too).
+		context.on("request", (request) => {
+			if (!request.url().includes("qwen.ai")) return;
+			const auth = request.headers().authorization;
+			if (auth?.startsWith("Bearer ") && auth.length > 10) {
+				if (!capturedToken) {
+					console.log(`[Qwen] Captured authorization token from request.`);
+					capturedToken = auth.replace("Bearer ", "");
 				}
+				void tryResolve();
 			}
 		});
 
@@ -135,7 +145,31 @@ export async function loginQwenWeb(params: {
 			}
 		});
 
-		page.on("close", () => {
+		// If the user closes the qwen tab, try to recover with another qwen tab
+		// (the token lives in the profile, not the tab). Only give up if none remain.
+		page.on("close", async () => {
+			if (resolved) return;
+			const replacement = context.pages().find((p) => p.url().includes("chat.qwen.ai"));
+			if (replacement) {
+				page = replacement;
+				console.log(`[Qwen] Tab closed; switched to another Qwen tab.`);
+				return;
+			}
+			const token = await readLocalStorageToken().catch(() => undefined);
+			const cookies = await context
+				.cookies(["https://chat.qwen.ai", "https://qwen.ai"])
+				.catch(() => []);
+			if (token && cookies.length > 2) {
+				resolved = true;
+				clearTimeout(timeout);
+				console.log(`[Qwen] Session token captured from profile after tab close.`);
+				resolve({
+					sessionToken: token,
+					cookie: cookies.map((c) => `${c.name}=${c.value}`).join("; "),
+					userAgent,
+				});
+				return;
+			}
 			reject(new Error("Browser window closed before login was captured."));
 		});
 
