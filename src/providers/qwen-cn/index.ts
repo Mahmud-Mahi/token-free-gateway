@@ -7,8 +7,10 @@ export const definition: ProviderDefinition = {
 	id: "qwen-cn-web",
 	name: "Qwen CN Web",
 	models: [
-		{ id: "Qwen3.5-Plus", name: "Qwen 3.5 Plus (CN)" },
-		{ id: "Qwen3.5-Turbo", name: "Qwen 3.5 Turbo (CN)" },
+		{ id: "qwen3.7-cn", name: "Qwen 3.7 (CN)" },
+		{ id: "qwen3.8-max-cn", name: "Qwen 3.8 Max (CN)" },
+		{ id: "qwen3.7-max-cn", name: "Qwen 3.7 Max (CN)" },
+		{ id: "qwen3.6-flash-cn", name: "Qwen 3.6 Flash (CN)" },
 	],
 	factory: (credentials) => new QwenCNWebClient(credentials as QwenCNWebAuth),
 	loginFn: loginQwenCNWeb,
