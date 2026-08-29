@@ -6,9 +6,9 @@ export const definition: ProviderDefinition = {
 	id: "kimi-web",
 	name: "Kimi (Web)",
 	models: [
-		{ id: "moonshot-v1-8k", name: "Moonshot v1 8K" },
-		{ id: "moonshot-v1-32k", name: "Moonshot v1 32K" },
-		{ id: "moonshot-v1-128k", name: "Moonshot v1 128K" },
+		{ id: "k3-instant", name: "Kimi Instant" },
+		{ id: "k3", name: "Kimi K3" },
+		{ id: "k3-stream", name: "Kimi K3 Stream" },
 	],
 	factory: (credentials) => new KimiWebClient(credentials as any),
 	loginFn: loginKimiWeb,
