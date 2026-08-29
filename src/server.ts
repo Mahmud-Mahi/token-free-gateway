@@ -3,6 +3,7 @@ import { BrowserManager } from "./browser/manager.ts";
 import { loadConfig } from "./config.ts";
 import { handleChatCompletions, setRouteTimeoutSec } from "./openai/chat-completions.ts";
 import { listAuthorizedProviders } from "./providers/auth-store.ts";
+import type { ClaudeWebClient } from "./providers/claude/client.ts";
 import {
 	checkAllSessions,
 	getClientForModel,
@@ -57,6 +58,10 @@ async function handleRequest(req: Request): Promise<Response> {
 	if (pathname.startsWith("/v1/models/") && req.method === "GET") {
 		const modelId = decodeURIComponent(pathname.slice("/v1/models/".length));
 		return withCors(await handleModelByIdRoute(modelId));
+	}
+
+	if (pathname === "/v1/providers/claude-web/discover" && req.method === "GET") {
+		return withCors(await handleClaudeDiscoverRoute());
 	}
 
 	return withCors(
@@ -125,6 +130,7 @@ async function handleModelsRoute(): Promise<Response> {
 			object: "model" as const,
 			created: now,
 			owned_by: (await resolveModelToProvider(m.id)) ?? "web-provider",
+			name: m.name,
 		})),
 	);
 	return Response.json({ object: "list", data });
@@ -144,7 +150,36 @@ async function handleModelByIdRoute(modelId: string): Promise<Response> {
 		object: "model",
 		created: Math.floor(Date.now() / 1000),
 		owned_by: (await resolveModelToProvider(model.id)) ?? "web-provider",
+		name: model.name,
 	});
+}
+
+async function handleClaudeDiscoverRoute(): Promise<Response> {
+	try {
+		const { getProviderClient } = await import("./providers/registry.ts");
+		const client = await getProviderClient("claude-web");
+		if (!client) {
+			return Response.json(
+				{
+					error: {
+						message: "Claude provider not authorized. Run 'token-free-gateway webauth'.",
+						type: "invalid_request_error",
+					},
+				},
+				{ status: 404 },
+			);
+		}
+		const claudeClient = client as unknown as ClaudeWebClient;
+		const models = await claudeClient.discoverAvailableModels();
+		return Response.json({
+			available_models: models,
+			message: "Use these model IDs with the Claude provider",
+			config_models: client.listModels().map((m) => m.id),
+		});
+	} catch (err) {
+		const message = err instanceof Error ? err.message : String(err);
+		return Response.json({ error: { message, type: "server_error" } }, { status: 500 });
+	}
 }
 
 // ── Server bootstrap ─────────────────────────────────────────
