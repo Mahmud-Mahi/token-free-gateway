@@ -78,6 +78,9 @@ export interface ResponseMessage {
 	role: "assistant";
 	content: string | null;
 	tool_calls?: ToolCallOutput[];
+	reasoning_content?: string | null;
+	reasoning?: string | null;
+	thinking?: string | null;
 }
 
 export interface ToolCallOutput {
@@ -114,6 +117,9 @@ export interface ChunkChoice {
 export interface ChunkDelta {
 	role?: "assistant";
 	content?: string | null;
+	reasoning_content?: string | null;
+	reasoning?: string | null;
+	thinking?: string | null;
 	tool_calls?: ToolCallDelta[];
 }
 
